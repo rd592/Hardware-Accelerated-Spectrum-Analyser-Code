@@ -1,0 +1,82 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+--This IP is designed to generate the tlast signal for the DMA. 
+--It counts the number of samples sent through using tvalid, tready, and discards the empty right channel data with tid
+
+entity tlast_generator is
+    Port ( 
+        aclk : in  STD_LOGIC;
+        aresetn : in  STD_LOGIC;
+        
+        sample_threshold : in STD_LOGIC_VECTOR(31 downto 0);--max number of samples before tlast activated
+        --INPUTS
+        s_axis_tdata : in  STD_LOGIC_VECTOR (31 downto 0);--audio data from i2s receiver
+        s_axis_tvalid : in  STD_LOGIC;--signal from i2s receiver, active when a valid sample is on the bus
+        s_axis_tready : out STD_LOGIC;--signal from dma, active when dma is ready to receive a new sample
+        s_axis_tid : in STD_LOGIC_VECTOR(2 downto 0);--which audio channel is being sent. "00" for left.
+        
+        --OUTPUTS
+        m_axis_tdata : out STD_LOGIC_VECTOR (31 downto 0); 
+        m_axis_tvalid : out STD_LOGIC;
+        m_axis_tready : in  STD_LOGIC;
+        m_axis_tlast : out STD_LOGIC
+    );
+   
+   --this groups the signals together on the IP block, looks neater
+    ATTRIBUTE X_INTERFACE_INFO : STRING;
+    ATTRIBUTE X_INTERFACE_INFO of s_axis_tvalid : SIGNAL is "xilinx.com:interface:axis:1.0 s_axis TVALID";
+    ATTRIBUTE X_INTERFACE_INFO of s_axis_tdata : SIGNAL is "xilinx.com:interface:axis:1.0 s_axis TDATA";
+    ATTRIBUTE X_INTERFACE_INFO of s_axis_tready : SIGNAL is "xilinx.com:interface:axis:1.0 s_axis TREADY";
+    ATTRIBUTE X_INTERFACE_INFO of s_axis_tid : SIGNAL is "xilinx.com:interface:axis:1.0 s_axis TID";
+    
+    ATTRIBUTE X_INTERFACE_INFO of m_axis_tdata : SIGNAL is "xilinx.com:interface:axis:1.0 m_axis TDATA";
+    ATTRIBUTE X_INTERFACE_INFO of m_axis_tvalid : SIGNAL is "xilinx.com:interface:axis:1.0 m_axis TVALID";
+    ATTRIBUTE X_INTERFACE_INFO of m_axis_tready : SIGNAL is "xilinx.com:interface:axis:1.0 m_axis TREADY";
+    ATTRIBUTE X_INTERFACE_INFO of m_axis_tlast : SIGNAL is "xilinx.com:interface:axis:1.0 m_axis TLAST";
+     
+end tlast_generator;
+
+architecture Behavioral of tlast_generator is
+    signal sample_count : unsigned(31 downto 0) := (others => '0'); --counter to keep track of number of samples.
+    signal threshold : unsigned(31 downto 0);--value set to the input sample threshold
+    
+begin
+
+    -- if python hasn't set the threshold, or the threshold is set to 0, default to 4096
+    threshold <= to_unsigned(4096, 32) when unsigned(sample_threshold) = 0 else unsigned(sample_threshold);
+
+    process(aclk)
+    begin
+        if rising_edge(aclk) then
+            if aresetn = '0' then
+                sample_count <= (others => '0');--reset sample_count value when reset triggered
+
+                
+            elsif (s_axis_tvalid = '1' and m_axis_tready = '1') then --new sample when both tvalid and tready are true
+                
+                --only increment if left channel
+                if s_axis_tid = "000" then
+                    if sample_count >= threshold - 1 then 
+                        sample_count <= (others => '0'); --reset once sample threshold reached
+                    else
+                        sample_count <= sample_count + 1; --increment counter
+                    end if;
+                end if;
+                
+            end if;
+        end if;
+    end process;
+
+    m_axis_tdata  <= s_axis_tdata; --send audio data straight through
+    
+   
+    m_axis_tvalid <= '1' when (s_axis_tvalid = '1' and s_axis_tid = "000" ) else '0';--valid sample only when left channel, and tvalid true
+    
+    s_axis_tready <= m_axis_tready; 
+    
+    --tlast is true only when the sample threshold has been reached, starting DMA transfer
+    m_axis_tlast  <= '1' when (sample_count >= threshold - 1 and s_axis_tvalid = '1'  and s_axis_tid = "000") else '0';
+
+end Behavioral;

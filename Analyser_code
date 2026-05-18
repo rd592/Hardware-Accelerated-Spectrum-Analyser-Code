@@ -1,0 +1,145 @@
+import time
+import smbus2 as smbus
+import numpy as np
+import matplotlib.pyplot as plt
+from pynq import Overlay, allocate
+from IPython.display import Audio, display
+
+#options are 512, 1024 4096 for    FFT length (Higher length = more freq bin resolution, longer time to complete)
+ol = Overlay("Analyser 2804 512.bit")
+time.sleep(0.5) 
+
+bus = smbus.SMBus(1) 
+I2C_ADDR = 0x3B 
+gpio_timer = ol.axi_gpio_0 #tlast generator, controls when to send data from DMA
+gpio_fft = ol.axi_gpio_1 #FFT configuration GPIO
+i2s = ol.i2s_receiver_0 #I2S receiver
+dma = ol.axi_dma_0 #set up dma
+
+def write_adau(reg, data):
+    bus.write_i2c_block_data(I2C_ADDR, (reg >> 8) & 0xFF, [reg & 0xFF, data])
+
+CHANNEL_SELECT = 1 #select between line in and mic
+
+SAMPLE_RATE = 48000 #48kHz standard audio sample rate
+FFT_POINTS = 512 #change this based on overlay 
+
+#must be at least as long as the time to complete one FFT run (FFT POINTS/ SAMPLE RATE)
+# 512 - (>10.6ms), 1024 - (>21.3ms), 4096 - (>85.3ms)
+RECORD_SECONDS = 0.0107
+
+#codec setup
+try:
+    write_adau(0x4000, 0x01) #Clock Control - clock core enabled
+    write_adau(0x40F9, 0x7F) #Clock Enable - all clock engine enabled
+    write_adau(0x40FA, 0x01) #ADC sample rate clock enable
+    write_adau(0x4015, 0x01) #Serial Port Control - master mode
+    write_adau(0x4016, 0x00) #Serial Port Control - 1 bit clock cycle delay
+    write_adau(0x4019, 0x23) #DC offset removal
+    
+    
+    if CHANNEL_SELECT == 0 :     
+        #Mic input
+        write_adau(0x4008, 0x01) #enable mic
+
+        write_adau(0x400A, 0x71) #Left mixer on, +6db gain
+        write_adau(0x400B, 0x10) #no gain boost for AUX
+
+        write_adau(0x400C, 0x71) #Right mixer on, +6db gain
+        write_adau(0x400D, 0x10) #no gain boost for AUX
+    
+    else:
+        #Line input
+        write_adau(0x4008, 0x00) #enable line in
+        
+        write_adau(0x4009, 0x20) #Mic bias boost level 1
+        
+        write_adau(0x400A, 0x01) #Left mixer on
+        write_adau(0x400B, 0x0D) #no gain boost
+        
+        write_adau(0x400C, 0x00) #Right mixer on
+        write_adau(0x400D, 0x00) #no gain boost
+    
+    
+    # Unmute ADCs
+    write_adau(0x400E, 0x00) #no gain boost to input volume left channel
+    write_adau(0x400F, 0x00) #no gain boost to input volume right channel
+    write_adau(0x4019, 0x33) #High pass filter to remove DC noise, both ADCs enabled
+except OSError as e:
+    print(f"I2C error: {e}")
+
+
+#Set the hardware frame size so tlast fires correctly
+gpio_timer.channel1.write(FFT_POINTS, 0xFFFFFFFF)
+
+gpio_fft.channel1.write(0x01, 0xFFFFFFFF)#fft setup
+gpio_fft.channel2.write(1, 1) 
+gpio_fft.channel2.write(0, 1)
+
+#64 bit input from DMA, imaginary and real components
+fft_buffer = allocate(shape=(FFT_POINTS,), dtype=np.int64)
+
+full_audio = []
+
+
+# 512 - (>10.6ms), 1024 - (>21.3ms), 4096 - (>85.3ms) at 48KHz
+time_per_frame = FFT_POINTS / SAMPLE_RATE
+num_frames = int(RECORD_SECONDS / time_per_frame)
+
+#set clock dividers, SCLK = 2*24*Fs = 2.304MHz
+#I2S receiver uses 9.216MHz clock, divider = 9.126/(2.304*2) = 2
+i2s.write(0x20, 0x02) 
+i2s.write(0x08, 0x01) #turn on I2S receiver, left justify
+
+print(f"Data capture of FFT length {FFT_POINTS} at {RECORD_SECONDS:.3f} seconds:")
+start_time = time.time()
+
+for i in range(num_frames):
+    dma.recvchannel.transfer(fft_buffer) #start DMA capture
+    dma.recvchannel.wait()
+    full_audio.append(np.copy(fft_buffer)) #add new data to array
+
+capture_time = time.time() - start_time 
+print(f"Complete in {capture_time:.4f} seconds")
+
+#convert to numpy array
+raw_data = np.array(full_audio, dtype=np.int64)
+#flat_data = raw_data.flatten()
+
+#real data is bottom 32 bits, signed
+real_data = raw_data & 0xFFFFFFFF
+real_data[real_data >= 0x80000000] -= 0x100000000 
+
+#imaginary data is top 32 bits, signed
+imag_data = (raw_data >> 32) & 0xFFFFFFFF
+imag_data[imag_data >= 0x80000000] -= 0x100000000 
+
+MAX_32BIT = 4294967295.0 #max 32 bit value for calulations
+
+
+magnitude = np.sqrt(real_data.astype(float)**2 + imag_data.astype(float)**2)
+
+#find average magnitude to normalise results
+avg_magnitude = np.mean(magnitude, axis=0)
+avg_magnitude = avg_magnitude 
+
+magnitude_norm = avg_magnitude / MAX_32BIT #normalise magnitude data to the mean
+magnitude_dbfs = 20 * np.log10(magnitude_norm + 1e-12)#convert to dbs
+
+
+#data plotting
+
+x_axis = np.linspace(0, SAMPLE_RATE/2, FFT_POINTS//2)
+plt.figure(figsize=(16, 8))
+plt.plot(x_axis, magnitude_dbfs[:FFT_POINTS//2], color='purple')
+plt.xscale('log')  
+plt.title("Frequency Spectrum")
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("Magnitude (dB)")
+plt.grid(True, alpha=0.2, which='both')
+plt.xlim(20, 20000)
+plt.show()
+
+
+del fft_buffer
+bus.close()

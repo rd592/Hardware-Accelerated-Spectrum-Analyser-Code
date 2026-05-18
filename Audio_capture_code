@@ -1,0 +1,143 @@
+import time
+import smbus2 as smbus
+import numpy as np
+import matplotlib.pyplot as plt
+from pynq import Overlay, allocate
+from IPython.display import Audio, display
+
+print("setting up...")
+
+ol = Overlay("Analyser 2604 AUDIO 6.bit") # 2604 audio 6 is same as 2604 1, audio rather than fft
+time.sleep(0.5) 
+
+bus = smbus.SMBus(1) 
+I2C_ADDR = 0x3B 
+
+def write_adau(reg, data):
+    bus.write_i2c_block_data(I2C_ADDR, (reg >> 8) & 0xFF, [reg & 0xFF, data])
+
+CHANNEL_SELECT = 1 #select between line in and mic
+  
+#codec setup    
+try:
+    write_adau(0x4000, 0x01) #Clock Control - clock core enabled
+    write_adau(0x40F9, 0x7F) #Clock Enable - all clock engine enabled
+    write_adau(0x40FA, 0x01) #ADC sample rate clock enable
+    write_adau(0x4015, 0x01) #Serial Port Control - master mode
+    write_adau(0x4016, 0x00) #Serial Port Control - 1 bit clock cycle delay
+    write_adau(0x4019, 0x23) #DC offset removal
+    
+    if CHANNEL_SELECT == 0 :     
+        #Mic input
+        write_adau(0x4008, 0x01) #enable mic
+
+        write_adau(0x400A, 0x71) #Left mixer on, +6db gain
+        write_adau(0x400B, 0x10) #no gain boost for AUX
+
+        write_adau(0x400C, 0x71) #Right mixer on, +6db gain
+        write_adau(0x400D, 0x10) #no gain boost for AUX
+    
+    else:
+        #Line input
+        write_adau(0x4008, 0x00) #enable line in
+        
+        write_adau(0x4009, 0x20) #Mic bias boost level 1
+        
+        write_adau(0x400A, 0x01) #Left mixer on
+        write_adau(0x400B, 0x0D) #no gain boost
+        
+        write_adau(0x400C, 0x00) #Right mixer on
+        write_adau(0x400D, 0x00) #no gain boost
+    
+    
+    # Unmute ADCs
+    write_adau(0x400E, 0x00) #no gain boost to input volume left channel
+    write_adau(0x400F, 0x00) #no gain boost to input volume right channel
+    write_adau(0x4019, 0x33) #High pass filter to remove DC noise, both ADCs enabled
+    print("codec configured")
+    
+except OSError as e:
+    print(f" I2C Error: {e}")
+
+
+###record and transfer data in chunks, dma can only handle ~0.6s of 24 bit audio at a time
+CHUNK_SECONDS = 0.5 
+SAMPLE_RATE = 48000 
+
+CHUNK_WORDS = int(CHUNK_SECONDS * SAMPLE_RATE)
+RECORD_SECONDS = 1 #must be a multiple of CHUNK_SECONDS as this is the shortest recording time
+
+#set the tlast_generator sample_threshold value, number of samples before send chunk to dma
+gpio = ol.axi_gpio_0 
+gpio.channel1.write(CHUNK_WORDS, 0xFFFFFFFF) 
+
+
+#set up dma and buffer
+dma = ol.axi_dma_0
+audio_buffer = allocate(shape=(CHUNK_WORDS,), dtype=np.int32)
+full_audio = []
+
+i2s = ol.i2s_receiver_0
+#write LRCLK and SCLK divider value
+i2s.write(0x20, 0x2002) 
+
+#turn on I2S receiver IP
+i2s.write(0x08, 0x01)
+
+
+print(f"Recording of {RECORD_SECONDS:.2f} seconds started:")
+start_time = time.time()
+
+#loop chunks
+for i in range(int(2*RECORD_SECONDS)): 
+    dma.recvchannel.transfer(audio_buffer)
+    dma.recvchannel.wait()
+    full_audio.append(np.copy(audio_buffer)) 
+
+
+capture_time = time.time() - start_time 
+print(f"Complete in {capture_time:.2f} seconds")
+
+#concatenate audio into single array
+full_audio = np.concatenate(full_audio) 
+
+#remove additional empty 8 bits
+full_audio = full_audio & 0x00FFFFFF
+#sign audio
+full_audio[full_audio >= 0x800000] -= 0x1000000
+
+#remove DC offset
+full_audio = full_audio - np.mean(full_audio)
+full_audio = full_audio.flatten()
+
+
+#raw_audio = np.array(full_audio, dtype=np.int32) 
+#test software FFT
+fft1 = np.fft.fft(full_audio, axis = 0)
+software_magnitude = np.abs(fft1)
+
+
+#time domain plot
+plt.figure(figsize=(16, 10))
+plt.plot(np.linspace(0, float(RECORD_SECONDS), len(full_audio)), full_audio, color='#1f77b4')
+plt.title("Audio Capture")
+plt.xlabel("Time (Seconds)")
+plt.ylabel("Amplitude")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+#FFT plot
+software_db = 20 * np.log10(software_magnitude / np.max(software_magnitude) + 1e-12)
+x_axis = np.linspace(0, SAMPLE_RATE/2, len(software_db)//2)
+
+plt.figure(figsize=(12, 6))
+plt.plot(x_axis, software_db[:len(software_db)//2], color='blue')
+plt.xscale('log')  
+plt.title("Software FFT")
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("Amplitude")
+plt.xlim(20, 20000)
+plt.ylim(-120,20)
+plt.show()
+
+del audio_buffer
